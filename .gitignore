@@ -1,4 +1,9 @@
 .vscode/
 __pycache__/
 *.pyc
+*/__pycache__/
+
 processed_data/
+features/*.joblib
+features/*.npy
+submission/submission_*.csv
