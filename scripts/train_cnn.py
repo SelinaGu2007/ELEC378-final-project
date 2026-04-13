@@ -16,9 +16,7 @@ from torchvision import transforms
 from sklearn.model_selection import train_test_split
 
 
-# -----------------------------
 # Reproducibility
-# -----------------------------
 def set_seed(seed: int = 42) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -26,9 +24,8 @@ def set_seed(seed: int = 42) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-# -----------------------------
+
 # Paths and constants
-# -----------------------------
 DATA_DIR = "data"
 
 TRAIN_CSV = os.path.join(DATA_DIR, "train.csv")
@@ -47,9 +44,8 @@ IMAGE_SIZE = (128, 128)
 SEED = 42
 
 
-# -----------------------------
+
 # Dataset
-# -----------------------------
 class ButterflyDataset(Dataset):
     def __init__(self, df: pd.DataFrame, img_dir: str, transform=None, labeled: bool = True):
         self.df = df.reset_index(drop=True)
@@ -79,9 +75,8 @@ class ButterflyDataset(Dataset):
         return image, row[ID_COL]
 
 
-# -----------------------------
+
 # Model
-# -----------------------------
 class SimpleCNN(nn.Module):
     def __init__(self, num_classes: int):
         super().__init__()
@@ -113,9 +108,7 @@ class SimpleCNN(nn.Module):
         return x
 
 
-# -----------------------------
 # Training / evaluation
-# -----------------------------
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -173,9 +166,7 @@ def evaluate(
     return total_loss / total, total_correct / total
 
 
-# -----------------------------
 # Main
-# -----------------------------
 if __name__ == "__main__":
     set_seed(SEED)
 
