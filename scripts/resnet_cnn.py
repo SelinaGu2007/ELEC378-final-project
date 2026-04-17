@@ -30,6 +30,7 @@ MODELS_DIR = "models"
 SUBMISSION_DIR = "submission"
 CHECKPOINT_PATH = os.path.join(MODELS_DIR, "cnn_resnet18_best.pth")
 LABEL_MAPPING_PATH = os.path.join(MODELS_DIR, "cnn_label_mapping.json")
+OUTPUT_PATH = os.path.join(SUBMISSION_DIR, "submission_cnn_resnet18.csv")
 
 
 # =========================
@@ -75,6 +76,27 @@ class ButterflyDataset(Dataset):
         image = self.transform(image)
         label_index = self.label_to_index[row["TARGET"]]
         return image, label_index
+
+
+class TestImageDataset(Dataset):
+    """Dataset for loading test images in a stable order."""
+
+    def __init__(self, file_names: list[str], image_dir: str, transform: transforms.Compose) -> None:
+        self.file_names = file_names
+        self.image_dir = image_dir
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.file_names)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, str]:
+        file_name = self.file_names[index]
+        image_path = os.path.join(self.image_dir, file_name)
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"Test image not found: {image_path}")
+        image = Image.open(image_path).convert("RGB")
+        image = self.transform(image)
+        return image, file_name
 
 
 def ensure_file_exists(path: str) -> None:
@@ -236,6 +258,110 @@ def save_label_mapping(class_names: list[str]) -> None:
     print(f"Saved label mapping to: {LABEL_MAPPING_PATH}")
 
 
+def load_label_mapping() -> list[str]:
+    """Read class names saved during training."""
+    with open(LABEL_MAPPING_PATH, "r", encoding="utf-8") as mapping_file:
+        mapping = json.load(mapping_file)
+    return mapping["class_names"]
+
+
+def build_submission_frame() -> pd.DataFrame:
+    """Load template CSV if available, otherwise build one from test image names."""
+    if os.path.exists(SAMPLE_SUB_CSV):
+        print(f"Reading sample submission from: {SAMPLE_SUB_CSV}")
+        submission_df = pd.read_csv(SAMPLE_SUB_CSV)
+    else:
+        print("Sample submission file not found. Building submission from test_images/ filenames.")
+        test_ids = sorted(
+            os.path.splitext(file_name)[0]
+            for file_name in os.listdir(TEST_IMG_DIR)
+            if os.path.isfile(os.path.join(TEST_IMG_DIR, file_name))
+        )
+        submission_df = pd.DataFrame({"ID": test_ids, "TARGET": [""] * len(test_ids)})
+
+    return submission_df
+
+
+def build_test_filenames(submission_df: pd.DataFrame) -> list[str]:
+    """Map submission IDs to image filenames in test_images/."""
+    available_files = {
+        file_name
+        for file_name in os.listdir(TEST_IMG_DIR)
+        if os.path.isfile(os.path.join(TEST_IMG_DIR, file_name))
+    }
+    file_names: list[str] = []
+
+    for test_id in submission_df["ID"]:
+        candidate_name = f"{test_id}.jpg"
+        if candidate_name not in available_files:
+            raise FileNotFoundError(f"Missing test image: {candidate_name}")
+        file_names.append(candidate_name)
+
+    return file_names
+
+
+@torch.no_grad()
+def predict(model: nn.Module, dataloader: DataLoader, class_names: list[str], device: torch.device) -> list[str]:
+    """Run inference and convert class indices back to class names."""
+    model.eval()
+    predictions: list[str] = []
+
+    for images, _file_names in dataloader:
+        images = images.to(device)
+        outputs = model(images)
+        predicted_indices = outputs.argmax(dim=1).cpu().tolist()
+        predictions.extend(class_names[index] for index in predicted_indices)
+
+    return predictions
+
+
+def make_submission(device: torch.device) -> None:
+    """Load the best checkpoint and write the final submission CSV."""
+    required_paths = [TEST_IMG_DIR, CHECKPOINT_PATH, LABEL_MAPPING_PATH]
+    missing_paths = [path for path in required_paths if not os.path.exists(path)]
+    if missing_paths:
+        missing_text = "\n".join(missing_paths)
+        raise FileNotFoundError(f"Missing required project paths:\n{missing_text}")
+
+    class_names = load_label_mapping()
+    num_classes = len(class_names)
+    print(f"Loaded label mapping with {num_classes} classes.")
+
+    submission_df = build_submission_frame()
+    test_file_names = build_test_filenames(submission_df)
+    print(f"Number of test images to predict: {len(test_file_names)}")
+
+    test_dataset = TestImageDataset(
+        file_names=test_file_names,
+        image_dir=TEST_IMG_DIR,
+        transform=build_val_transform(),
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+    )
+
+    print("Loading trained ResNet-18 checkpoint...")
+    checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
+    model = get_resnet18(num_classes=num_classes).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+
+    print("Running predictions on the test set...")
+    predictions = predict(model, test_loader, class_names, device)
+
+    submission_df["TARGET"] = predictions
+    submission_df = submission_df[["ID", "TARGET"]]
+    submission_df.to_csv(OUTPUT_PATH, index=False)
+
+    print(f"Saved submission file to: {OUTPUT_PATH}")
+    print(f"Submission rows: {len(submission_df)}")
+
+    if len(submission_df) != 1000:
+        print("Warning: submission does not contain 1000 rows.")
+
+
 def validate_required_paths() -> None:
     """Stop early with a helpful error if required files are missing."""
     required_paths = [TRAIN_CSV, TRAIN_IMG_DIR]
@@ -322,6 +448,9 @@ def main() -> None:
 
     print("Training finished.")
     print(f"Best validation accuracy: {best_val_accuracy:.4%}")
+
+    print("Creating final submission file...")
+    make_submission(device)
 
 
 if __name__ == "__main__":
