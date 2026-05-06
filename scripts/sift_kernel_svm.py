@@ -1,3 +1,20 @@
+"""
+SIFT + BoVW + Kernel SVM baseline for ELEC378 final project.
+
+This script implements the non-neural-network baseline described in the report.
+It is NOT the best Kaggle model. The best submitted model is the CNN/EfficientNet
+pipeline, indicated in the corresponding training script.
+
+Pipeline:
+1. 80/20 stratified train-validation split
+2. grayscale conversion
+3. SIFT descriptor extraction
+4. BoVW vocabulary with MiniBatchKMeans
+5. normalized BoVW histograms
+6. RBF-kernel SVM classifier
+7. Kaggle submission generation
+"""
+
 from __future__ import annotations
 
 import os
@@ -15,19 +32,9 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.svm import SVC
 
 
-# Stage flags
-RUN_SPLIT = True
-RUN_SANITY_CHECK = True
-RUN_BUILD_BOVW = True
-RUN_TRAIN = True
-RUN_SUBMISSION = True
-
-
 # Pipeline settings
 RANDOM_SEED = 42
 VAL_RATIO = 0.20
-SANITY_CHECK_SAMPLE_SIZE = 20
-VISUALIZE_SAMPLE = False
 
 VOCAB_SIZE = 100
 MAX_DESCRIPTORS_FOR_KMEANS = 50_000
@@ -39,16 +46,16 @@ GAMMA = "scale"
 
 # Paths and constants
 DATA_DIR = "data"
+FEATURES_DIR = "features"
+SUBMISSION_DIR = "submission"
 
 TRAIN_CSV_PATH = os.path.join(DATA_DIR, "train.csv")
-SAMPLE_SUBMISSION_PATH = os.path.join(DATA_DIR, "sample_submission.csv")
-TRAIN_IMAGE_DIR = os.path.join(DATA_DIR, "train_images", "train_images")
-TEST_IMAGE_DIR = os.path.join(DATA_DIR, "test_images", "test_images")
+SAMPLE_SUBMISSION_PATH = os.path.join(SUBMISSION_DIR, "sample_submission.csv")
+TRAIN_IMAGE_DIR = os.path.join("train_images", "train_images")
+TEST_IMAGE_DIR = os.path.join("test_images", "test_images")
 TRAIN_SPLIT_PATH = os.path.join(DATA_DIR, "train_split.csv")
 VAL_SPLIT_PATH = os.path.join(DATA_DIR, "val_split.csv")
 
-FEATURES_DIR = "features"
-SUBMISSION_DIR = "submission"
 
 TRAIN_FEATURES_PATH = os.path.join(FEATURES_DIR, "train_bovw_features.npy")
 VAL_FEATURES_PATH = os.path.join(FEATURES_DIR, "val_bovw_features.npy")
@@ -63,12 +70,7 @@ LABEL_ENCODER_PATH = os.path.join(FEATURES_DIR, "sift_label_encoder.joblib")
 OUTPUT_SUBMISSION_PATH = os.path.join(SUBMISSION_DIR, "submission_sift_bovw_svc.csv")
 
 
-def ensure_file_exists(path: str) -> None:
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Required file not found: {path}")
-
-
-def validate_labeled_dataframe(df: pd.DataFrame, name: str) -> None:
+def validate_labeled_csv_columns(df: pd.DataFrame, name: str) -> None:
     required_columns = {"file_name", "TARGET"}
     if not required_columns.issubset(df.columns):
         raise ValueError(f"{name} CSV must contain columns: {sorted(required_columns)}")
@@ -98,6 +100,16 @@ def extract_sift_descriptors(
     return descriptors
 
 
+def extract_image_descriptors(
+    file_name: str,
+    image_dir: str,
+    sift_extractor: Any,
+) -> Optional[np.ndarray]:
+    image = load_image(file_name, image_dir)
+    gray_image = to_grayscale(image)
+    return extract_sift_descriptors(gray_image, sift_extractor)
+
+
 # Stage 1: train/validation split
 def split_train_val(
     input_csv: str = TRAIN_CSV_PATH,
@@ -106,9 +118,8 @@ def split_train_val(
     val_ratio: float = VAL_RATIO,
     random_seed: int = RANDOM_SEED,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    ensure_file_exists(input_csv)
     df = pd.read_csv(input_csv)
-    validate_labeled_dataframe(df, "Training")
+    validate_labeled_csv_columns(df, "Training")
 
     train_df, val_df = train_test_split(
         df,
@@ -134,76 +145,7 @@ def split_train_val(
     return train_df, val_df
 
 
-# Stage 2: SIFT sanity check
-def run_sift_sanity_check(
-    train_csv_path: str = TRAIN_CSV_PATH,
-    image_dir: str = TRAIN_IMAGE_DIR,
-    sample_size: int = SANITY_CHECK_SAMPLE_SIZE,
-    visualize_sample: bool = VISUALIZE_SAMPLE,
-) -> None:
-    ensure_file_exists(train_csv_path)
-    train_df = pd.read_csv(train_csv_path)
-    validate_labeled_dataframe(train_df, "Training")
-
-    sift_extractor = create_sift_extractor()
-    sample_df = train_df.head(sample_size).copy()
-
-    keypoint_counts: list[int] = []
-    images_with_no_descriptors = 0
-    example_printed = False
-
-    for row in sample_df.itertuples(index=False):
-        image = load_image(row.file_name, image_dir)
-        gray_image = to_grayscale(image)
-        keypoints, descriptors = sift_extractor.detectAndCompute(gray_image, None)
-
-        keypoint_counts.append(len(keypoints))
-        if descriptors is None:
-            images_with_no_descriptors += 1
-
-        if not example_printed:
-            descriptor_shape = None if descriptors is None else descriptors.shape
-            print("Example image result")
-            print(f"  File name: {row.file_name}")
-            print(f"  Label: {row.TARGET}")
-            print(f"  Original image shape: {image.shape}")
-            print(f"  Grayscale image shape: {gray_image.shape}")
-            print(f"  Number of keypoints: {len(keypoints)}")
-            print(f"  Descriptor shape: {descriptor_shape}")
-            print(f"  Descriptors are None: {descriptors is None}")
-
-            if visualize_sample:
-                import matplotlib.pyplot as plt
-
-                overlay = cv2.drawKeypoints(
-                    image,
-                    keypoints,
-                    None,
-                    flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS,
-                )
-                plt.figure(figsize=(6, 6))
-                plt.imshow(overlay)
-                plt.title(f"SIFT keypoints: {row.file_name}")
-                plt.axis("off")
-                plt.tight_layout()
-                plt.show()
-
-            example_printed = True
-
-    if not keypoint_counts:
-        print("No images were successfully processed.")
-        return
-
-    keypoint_array = np.array(keypoint_counts, dtype=np.float32)
-    print("\nSample summary")
-    print(f"  Number of images processed: {len(keypoint_counts)}")
-    print(f"  Images with no detected descriptors: {images_with_no_descriptors}")
-    print(f"  Min number of keypoints: {int(keypoint_array.min())}")
-    print(f"  Max number of keypoints: {int(keypoint_array.max())}")
-    print(f"  Mean number of keypoints: {float(keypoint_array.mean()):.2f}")
-
-
-# Stage 3: BoVW features
+# Stage 2: BoVW features
 def collect_image_descriptors(
     df: pd.DataFrame,
     sift_extractor: Any,
@@ -215,9 +157,7 @@ def collect_image_descriptors(
     images_with_no_descriptors = 0
 
     for row in df.itertuples(index=False):
-        image = load_image(row.file_name, image_dir)
-        gray_image = to_grayscale(image)
-        descriptors = extract_sift_descriptors(gray_image, sift_extractor)
+        descriptors = extract_image_descriptors(row.file_name, image_dir, sift_extractor)
 
         descriptor_list.append(descriptors)
         labels.append(row.TARGET)
@@ -260,15 +200,14 @@ def fit_visual_vocabulary(
     else:
         kmeans_descriptors = all_descriptors
 
-    n_clusters = min(vocab_size, int(kmeans_descriptors.shape[0]))
-    if n_clusters < vocab_size:
-        print(
-            f"Warning: only {kmeans_descriptors.shape[0]} descriptors available, "
-            f"so vocabulary size is reduced from {vocab_size} to {n_clusters}."
+    if kmeans_descriptors.shape[0] < vocab_size:
+        raise ValueError(
+            f"Cannot fit vocabulary of size {vocab_size} with only "
+            f"{kmeans_descriptors.shape[0]} descriptors."
         )
 
     kmeans = MiniBatchKMeans(
-        n_clusters=n_clusters,
+        n_clusters=vocab_size,
         random_state=random_seed,
         batch_size=1024,
         n_init=10,
@@ -316,14 +255,11 @@ def build_bovw_features(
     train_split_path: str = TRAIN_SPLIT_PATH,
     val_split_path: str = VAL_SPLIT_PATH,
     image_dir: str = TRAIN_IMAGE_DIR,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    ensure_file_exists(train_split_path)
-    ensure_file_exists(val_split_path)
-
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, MiniBatchKMeans]:
     train_df = pd.read_csv(train_split_path)
     val_df = pd.read_csv(val_split_path)
-    validate_labeled_dataframe(train_df, "Training split")
-    validate_labeled_dataframe(val_df, "Validation split")
+    validate_labeled_csv_columns(train_df, "Training split")
+    validate_labeled_csv_columns(val_df, "Validation split")
 
     sift_extractor = create_sift_extractor()
 
@@ -343,8 +279,6 @@ def build_bovw_features(
         image_dir=image_dir,
     )
 
-    print(f"Number of processed train images: {len(train_descriptor_list)}")
-    print(f"Number of processed val images: {len(val_descriptor_list)}")
     print(f"Number of train images with no descriptors: {train_no_desc}")
     print(f"Number of val images with no descriptors: {val_no_desc}")
 
@@ -374,21 +308,10 @@ def build_bovw_features(
     print(f"Saved BoVW features to: {FEATURES_DIR}")
     print(f"Saved BoVW vocabulary model to: {KMEANS_MODEL_PATH}")
 
-    return train_features, val_features, train_labels, val_labels
+    return train_features, val_features, train_labels, val_labels, kmeans
 
 
-# Stage 4 and 5: classifier training and evaluation
-def load_saved_bovw_features() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    for path in [TRAIN_FEATURES_PATH, VAL_FEATURES_PATH, TRAIN_LABELS_PATH, VAL_LABELS_PATH]:
-        ensure_file_exists(path)
-
-    train_features = np.load(TRAIN_FEATURES_PATH)
-    val_features = np.load(VAL_FEATURES_PATH)
-    train_labels = np.load(TRAIN_LABELS_PATH, allow_pickle=True)
-    val_labels = np.load(VAL_LABELS_PATH, allow_pickle=True)
-    return train_features, val_features, train_labels, val_labels
-
-
+# Stage 3: classifier training and evaluation
 def validate_feature_data(
     train_features: np.ndarray,
     val_features: np.ndarray,
@@ -424,20 +347,12 @@ def evaluate_classifier(
     }
 
 
-def train_sift_classifier(
-    train_features: Optional[np.ndarray] = None,
-    val_features: Optional[np.ndarray] = None,
-    train_labels: Optional[np.ndarray] = None,
-    val_labels: Optional[np.ndarray] = None,
+def train_and_evaluate_classifier(
+    train_features: np.ndarray,
+    val_features: np.ndarray,
+    train_labels: np.ndarray,
+    val_labels: np.ndarray,
 ) -> tuple[SVC, LabelEncoder, dict[str, Any]]:
-    if any(item is None for item in [train_features, val_features, train_labels, val_labels]):
-        train_features, val_features, train_labels, val_labels = load_saved_bovw_features()
-
-    assert train_features is not None
-    assert val_features is not None
-    assert train_labels is not None
-    assert val_labels is not None
-
     validate_feature_data(train_features, val_features)
 
     train_labels = train_labels.astype(str)
@@ -494,17 +409,15 @@ def train_sift_classifier(
     return classifier, label_encoder, metrics
 
 
-# Stage 6: submission
-def make_kaggle_submission(
+# Stage 4: submission
+def create_kaggle_submission(
+    kmeans: MiniBatchKMeans,
+    classifier: SVC,
+    label_encoder: LabelEncoder,
     sample_submission_path: Optional[str] = None,
     test_image_dir: str = TEST_IMAGE_DIR,
 ) -> str:
     submission_path = SAMPLE_SUBMISSION_PATH if sample_submission_path is None else sample_submission_path
-
-    ensure_file_exists(submission_path)
-    ensure_file_exists(KMEANS_MODEL_PATH)
-    ensure_file_exists(CLASSIFIER_PATH)
-    ensure_file_exists(LABEL_ENCODER_PATH)
 
     submission_df = pd.read_csv(submission_path)
     required_columns = {"ID", "TARGET"}
@@ -514,9 +427,6 @@ def make_kaggle_submission(
         )
 
     sift_extractor = create_sift_extractor()
-    kmeans: MiniBatchKMeans = joblib.load(KMEANS_MODEL_PATH)
-    classifier: SVC = joblib.load(CLASSIFIER_PATH)
-    label_encoder: LabelEncoder = joblib.load(LABEL_ENCODER_PATH)
 
     print(f"Number of test rows loaded: {len(submission_df)}")
 
@@ -524,9 +434,7 @@ def make_kaggle_submission(
 
     for row in submission_df.itertuples(index=False):
         file_name = f"{row.ID}.jpg"
-        image = load_image(file_name, test_image_dir)
-        gray_image = to_grayscale(image)
-        descriptors = extract_sift_descriptors(gray_image, sift_extractor)
+        descriptors = extract_image_descriptors(file_name, test_image_dir, sift_extractor)
         histogram = encode_bovw_histogram(descriptors, kmeans)
         features.append(histogram)
 
@@ -545,25 +453,15 @@ def make_kaggle_submission(
 
 
 def main() -> None:
-    train_features: Optional[np.ndarray] = None
-    val_features: Optional[np.ndarray] = None
-    train_labels: Optional[np.ndarray] = None
-    val_labels: Optional[np.ndarray] = None
-
-    if RUN_SPLIT:
-        split_train_val()
-
-    if RUN_SANITY_CHECK:
-        run_sift_sanity_check()
-
-    if RUN_BUILD_BOVW:
-        train_features, val_features, train_labels, val_labels = build_bovw_features()
-
-    if RUN_TRAIN:
-        train_sift_classifier(train_features, val_features, train_labels, val_labels)
-
-    if RUN_SUBMISSION:
-        make_kaggle_submission()
+    split_train_val()
+    train_features, val_features, train_labels, val_labels, kmeans = build_bovw_features()
+    classifier, label_encoder, _ = train_and_evaluate_classifier(
+        train_features,
+        val_features,
+        train_labels,
+        val_labels,
+    )
+    create_kaggle_submission(kmeans, classifier, label_encoder)
 
 
 if __name__ == "__main__":
