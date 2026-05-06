@@ -1,7 +1,3 @@
-# Before you start, you should do an Ananconda environment setup. Search it up online, it will make collaborations 
-# so much easier. 
-# The libraries in your conda environment can be transferred as a .yml file, which is great.
-
 import os
 import sys
 import time
@@ -20,7 +16,7 @@ from torchvision import transforms
 from skimage.feature import hog
 from skimage import color
 from tqdm import tqdm
-# Modify these paths to match your dataset. 
+# directory setup
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 CSV_PATH         = os.path.join(BASE_DIR, "train.csv")
@@ -30,13 +26,13 @@ TEST_IMG_DIR     = os.path.join(BASE_DIR, "test_images")
 SUBMISSION_PATH  = os.path.join(BASE_DIR, "submission.csv")
 
 # Cache paths
-HOG_CACHE_PATH   = os.path.join(BASE_DIR, "hog_features.npz")
+HOG_CACHE_PATH   = os.path.join(BASE_DIR, "hog_features.npz") # deprecated
 MODEL_CACHE_PATH = os.path.join(BASE_DIR, "efficientnet_model_big.pth")
 
 RANDOM_STATE = 42
 
 
-# ── Skeleton functions ────────────────────────────────────────────
+# copied from skeleton.py
 def load_metadata():
     df = pd.read_csv(CSV_PATH)
     print(df.columns)
@@ -57,7 +53,7 @@ def load_image_label_pair(df, index, size=128):
     return img, label
 
 
-# ── HOG extraction ────────────────────────────────────────────────
+# ─deprecated and can be removed, this was copied over from earlier SVM models
 from skimage.transform import rotate
 
 def extract_hog_features(file_list, size=128,
@@ -147,6 +143,7 @@ def get_hog_features(train_files, val_files, y_train, force_recompute=False):
 
     return X_train_hog, X_val_hog, y_train_aug
 
+#handles data loading
 class ButterflyDataset(Dataset):
     def __init__(self, file_names, labels, class_to_idx=None, transform=None):
         self.file_names = file_names
@@ -174,18 +171,20 @@ class ButterflyDataset(Dataset):
         return img, label
     
 class MBConvBlock(nn.Module):
+    #implementation of MBconv used in CNN
     def __init__(self, in_channels, out_channels, expand_ratio, stride, se_ratio=0.25):
         super().__init__()
         self.stride = stride
+        #skip connections if channel width between layers are the same
         self.use_residual = (stride == 1 and in_channels == out_channels)
-        mid = in_channels * expand_ratio
-
+        mid = in_channels * expand_ratio    
+        #expands by using 1x1 convolution
         self.expand = nn.Sequential(
             nn.Conv2d(in_channels, mid, 1, bias=False),
             nn.BatchNorm2d(mid),
             nn.SiLU()
         ) if expand_ratio != 1 else nn.Identity()
-
+        #3x3 convolution to each channel separately.
         self.depthwise = nn.Sequential(
             nn.Conv2d(mid, mid, 3, stride=stride, padding=1, groups=mid, bias=False),
             nn.BatchNorm2d(mid),
@@ -197,7 +196,7 @@ class MBConvBlock(nn.Module):
         self.se = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Linear(mid, se_channels),
+            nn.Linear(mid, se_channels),    
             nn.SiLU(),
             nn.Linear(se_channels, mid),
             nn.Sigmoid()
@@ -224,13 +223,15 @@ class ButterflyEfficientNet(nn.Module):
         super().__init__()
 
         # wider stem
-        # stem — outputs 40
+        # takes in 3 dimensional (RGB) information and quickly expands it into 40 features
+        # use stride = 2 to cut image size in half as well. 
         self.stem = nn.Sequential(
             nn.Conv2d(3, 40, 3, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(40),
             nn.SiLU()
         )
-
+        # Format: (in_channels, out_channels, expand_ratio, stride, num_repeats)
+        # depth and width adjusted based on initial training results over a small amount of epochs.
         # cfg — starts at 40, ends at 384
         cfg = [
             (40,  20,  1, 1, 1),
@@ -243,13 +244,12 @@ class ButterflyEfficientNet(nn.Module):
         ]
 
         
-# total: 20 blocks vs 22, channels unchanged
-# ~10% faster, minimal accuracy impact
 
         layers = []
         for in_c, out_c, exp, stride, n in cfg:
             for i in range(n):
                 layers.append(MBConvBlock(
+                    #only change the channel count on its first pass
                     in_c if i == 0 else out_c,
                     out_c, exp,
                     stride if i == 0 else 1
@@ -258,26 +258,31 @@ class ButterflyEfficientNet(nn.Module):
 
         # wider head with intermediate layer
         # head — expects 384 in
+        #very deep features (384) and expand that into a huge space for model to choose features to evaluate
         self.head = nn.Sequential(
             nn.Conv2d(384, 1536, 1, bias=False),
             nn.BatchNorm2d(1536),
             nn.SiLU(),
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
+            #harsh dropout at first to be robust
             nn.Dropout(0.5),
             nn.Linear(1536, 512),
             nn.SiLU(),
+            #lighter dropout later to not miss classes
             nn.Dropout(0.3),
+            #finally steps down to number of classes
             nn.Linear(512, num_classes)
         )
 
     def forward(self, x):
+        #goes from RGB through body(cfg) then out the head
         x = self.stem(x)
         x = self.blocks(x)
         x = self.head(x)
         return x
     
-
+#mixup and cutmix augmentation to increase robustness of features
 def mixup_batch(imgs, labels, alpha=0.4):
     lam = np.random.beta(alpha, alpha)
     idx = torch.randperm(imgs.size(0))
@@ -300,19 +305,22 @@ def cutmix_batch(imgs, labels, alpha=1.0):
     
 import copy
 from torch.cuda.amp import autocast, GradScaler
+#epochs to checkpoint model
 SAVE_EPOCHS = {100, 150, 200, 250, 300}
 def train_model(model, train_loader, val_loader, epochs=50):
-    
+    #need to use cuda or else it is too slow
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(device)
     model = model.to(device)
-
+    #add label smoothing so the model can generalize and makes it not overconfident
     criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+    #AdamW seems to be standard optimizer, add weight decay to keep weights small
     optimizer = optim.AdamW(model.parameters(), lr=5e-4, weight_decay=5e-5)
-    # replace your current scheduler:
+    # use warm restarts at certain epochs so that we can jump out of local minimas
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=20, T_mult=2)
 # restarts every 20 epochs, then 40, then 80...
-    scaler = GradScaler()  # ← new
+    #Added to hepl with compute time
+    scaler = GradScaler()  
 
     train_losses = []
     val_losses = [] 
@@ -325,7 +333,7 @@ def train_model(model, train_loader, val_loader, epochs=50):
         for imgs, labels in train_loader:
             imgs, labels = imgs.to(device), labels.to(device)
             optimizer.zero_grad()
-
+            #choose batch augmentation with equal probablility: mixup, cutmix, or none
             r = np.random.rand()
             if r < 0.33:
                 imgs, la, lb, lam = mixup_batch(imgs, labels)
@@ -333,22 +341,22 @@ def train_model(model, train_loader, val_loader, epochs=50):
                 imgs, la, lb, lam = cutmix_batch(imgs, labels)
             else:
                 la, lb, lam = labels, labels, 1.0
-
+            #do things in 16 bit someitmes to save compute
             with autocast():
                 outputs = model(imgs)
+                #loss has to reflect cutmix and mixup augmentation
                 loss = lam * criterion(outputs, la) + (1 - lam) * criterion(outputs, lb)
-
+            #backpropogation using scaler
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             total_loss += loss.item()
 
-        # rest of validation loop unchanged ...
 
         avg_train_loss = total_loss / len(train_loader)
         train_losses.append(avg_train_loss)
 
-        # ── VALIDATION ───────────────────
+        # validation so we turn off a lot the intensive compute and just tell it to predict things 
         model.eval()
         val_loss = 0
         correct = 0
@@ -376,7 +384,7 @@ def train_model(model, train_loader, val_loader, epochs=50):
         
         
 
-        # at the end of each epoch:
+        # at the end of each epoch check if it is the best model:
         if acc > best_acc:
             best_acc = acc
             best_state = copy.deepcopy(model.state_dict())  # store best weights
@@ -388,13 +396,13 @@ def train_model(model, train_loader, val_loader, epochs=50):
                 f"ckpt_epoch{epoch+1}_BEST_acc{best_acc:.4f}.pth"
             )
             torch.save(best_state, ckpt_path)
-            print(f"  ✅ Saved BEST-so-far model at epoch {epoch+1} (acc={best_acc:.4f})")
+            print(f"  Saved BEST-so-far model at epoch {epoch+1} (acc={best_acc:.4f})")
         
-    # remove the save from main(), model is already saved during training
+    # step the scheduler forward at the end of each epoch
         scheduler.step()
         print(f"Epoch {epoch+1:02d} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val Acc: {acc:.4f}")
 
-    # ── Plot ─────────────────────────
+    # plot training and validation loss across epochs
     plt.figure()
     plt.plot(train_losses, label="Train Loss")
     plt.plot(val_losses, label="Validation Loss")
@@ -410,7 +418,7 @@ def train_model(model, train_loader, val_loader, epochs=50):
             print(f"[Final] Best model saved with acc={best_acc:.4f}")
     return model
 
-# ── Submission ───────────────────────────────────────────────────
+# Basic submission just loads file and predicts it. 
 def generate_submission(model, test_files, class_to_idx, submission_path=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(device)
@@ -440,6 +448,8 @@ def generate_submission(model, test_files, class_to_idx, submission_path=None):
 
     print(f"Submission saved → {submission_path}")
 TTA_SUBMISSION_PATH = os.path.join(BASE_DIR, "tta_submission.csv")
+
+#Use TTA submission with augmented images to improve inference accuracy, ultimate submission was generated with this
 def generate_submission_tta(model, test_files, class_to_idx, n_augments=10, submission_path=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -474,7 +484,7 @@ def generate_submission_tta(model, test_files, class_to_idx, n_augments=10, subm
                 aug = tta_transform(img).unsqueeze(0).to(device)
                 with autocast():
                     all_outputs.append(model(aug))
-
+            #average of the predicitons
             avg_output = torch.stack(all_outputs).mean(0)
             pred = torch.argmax(avg_output, dim=1).item()
             preds.append(idx_to_class[pred])
@@ -483,14 +493,16 @@ def generate_submission_tta(model, test_files, class_to_idx, n_augments=10, subm
     sub_df["TARGET"] = preds
     sub_df.to_csv(submission_path, index=False)
     print(f"TTA submission saved → {submission_path}")
+
+# transformations to heavily augment data so the model can generalize
 train_transform = transforms.Compose([
     transforms.ToPILImage(),
     transforms.RandomHorizontalFlip(),
-    transforms.RandomVerticalFlip(),          # ← new
-    transforms.RandomRotation(30),            # ← was 20
-    transforms.RandomResizedCrop(224, scale=(0.7, 1.0)),  # ← wider scale
-    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),  # ← stronger
-    transforms.RandomGrayscale(p=0.1),        # ← new
+    transforms.RandomVerticalFlip(),          
+    transforms.RandomRotation(30),            
+    transforms.RandomResizedCrop(224, scale=(0.7, 1.0)),  
+    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),  
+    transforms.RandomGrayscale(p=0.1),       
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
@@ -501,11 +513,13 @@ val_transform = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
-# ── Main ─────────────────────────────────────────────────────────
-FORCE_RETRAIN = True   # 🔥 set to True when you want to retrain
+
+
+
+FORCE_RETRAIN = True   # this can be set to just run inference after we alreadu trained out model
 def main():
     df = load_metadata()
-
+    #80-20 stratification split
     X_train_files, X_val_files, y_train, y_val = train_test_split(
         df["file_name"].values,
         df["TARGET"].values,
@@ -521,13 +535,14 @@ def main():
         class_to_idx=train_dataset.class_to_idx,
         transform=val_transform
     )
+    # adjusted data loaders so persistent_workers=True to give speedup so they are alive between epochs.
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, 
                           num_workers=4, pin_memory=True, 
-                          persistent_workers=True)  # ← keeps workers alive between epochs
+                          persistent_workers=True)  
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False,
                         num_workers=4, pin_memory=True, persistent_workers=True)
     model = ButterflyEfficientNet(len(train_dataset.classes))
-    # model = torch.compile(model)  # ← add this, requires PyTorch 2.0+
+    
     if os.path.exists(MODEL_CACHE_PATH) and not FORCE_RETRAIN:
         print("[Cache] Loading model...")
         model.load_state_dict(torch.load(MODEL_CACHE_PATH, weights_only=True))
@@ -538,6 +553,7 @@ def main():
         print("[Cache] Model saved.")# in main()
     test_df = pd.read_csv(SAMPLE_SUB_PATH)
     test_files = test_df["ID"].values + ".jpg"  # → "test_000001.jpg"
+    #generate submissions for all model in checkpointed epochs with tta and non tta submissions.
     for epoch_num in SAVE_EPOCHS:
         ckpt_files = [
             f for f in os.listdir(BASE_DIR)
@@ -555,7 +571,7 @@ def main():
 
         model.load_state_dict(torch.load(ckpt_path, weights_only=True))
 
- #       SUBMISSION_PATH = os.path.join(BASE_DIR, f"submission_epoch{epoch_num}.csv")
+
 
         test_df = pd.read_csv(SAMPLE_SUB_PATH)
         test_files = test_df["ID"].values + ".jpg"
